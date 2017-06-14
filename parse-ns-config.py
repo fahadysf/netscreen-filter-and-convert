@@ -4,9 +4,10 @@ by the filtering and conversion scripts.
 """
 
 # Set the debug flag
-__DEBUG__ = True
+__DEBUG__ = False
 __FAILURES__ = 0
 
+import time
 import ZODB
 import ZODB.FileStorage
 import transaction
@@ -19,6 +20,7 @@ pp = pprint.PrettyPrinter(indent=2)
 
 def SetupZODB():
     storage = ZODB.FileStorage.FileStorage('data.zodb.fs')
+    storage.pack(time.time(), ZODB.serialize.referencesf)
     db = ZODB.DB(storage)
 
     connection = db.open()
@@ -164,26 +166,68 @@ def EnrichAddressObjDict(addresses_dict):
 def PopulatePolicies(cnfstr):
     lines = cnfstr.splitlines()
     policies = dict()
-    policy_main_re = re.compile(r'set policy id (?P<id>\d*)')
-    for l in lines:
-        if l.startswith('set policy id') and (('name' in l) or (('from' in l) and ('to' in l))):
-            id = re.search(r'set policy id (?<id>\d*)'. l).groupdict()['id']
-            name = re.search(r'name (?<name>\"[^\"]\")'.l).groupdict()['name']
-            name = re.search(r'name (?<name>\"[^\"]\")'.l).groupdict()['name']
-            policies[id] = {'name': name}
 
+    # Go through the first round to enumerate policies using the
+    # base line 'set policy <id> from <src_zone> to <dst_zone> ....
+    for l in lines:
+        if l.startswith('set policy id') and ('name' in l):
+            id = re.search(r'set policy id (?P<id>\d*)', l).groupdict()['id']
+            policies[id] = dict()
+            matchobj = re.search(r'name (?P<name>\"[^\"]*\")'
+                                          +'\s*from\s*\"(?P<src_zone>[^\"]*)\"'
+                                          +'\s*to\s*\"(?P<dst_zone>[^\"]*)\"'
+                                          +'\s*\"(?P<src>[^\"]*)\"'
+                                          +'\s*\"(?P<dst>[^\"]*)\"'
+                                          +'\s*\"(?P<service>[^\"]*)\"'
+                                          +'\s*(?P<action>\S+)'
+                                          +'\s*(?P<log_flag>\S+)?'
+                                          , l)
+            if matchobj:
+                policies[id].update(matchobj.groupdict())
+                policies[id]['src'] = [policies[id]['src']]
+                policies[id]['dst'] = [policies[id]['dst']]
+                policies[id]['service'] = [policies[id]['service']]
+                policies[id]['rawconfig'] = l
+
+            else:
+                __FAILURES__+=1
+                if __DEBUG__:
+                    print("Failure on: "+l)
+
+    # Go through a second round to add additional sources/destinations/services from
+    # set policy <id> \n set src-address|dst-address|service\nexit blocks
+    for id in policies.keys():
+        index = lines.index('set policy id ' + id)
+        l = lines[index]
+        block = [l]
+        n = index + 1
+        m = lines[n]
+        while 'exit' not in m:
+            block.append(m)
+            n += 1
+            m = lines[n]
+        block.append(m)
+        policies[id]['rawconfig'] = policies[id]['rawconfig']+'\n'+'\n'.join(block)
+        for k in block:
+            if k.startswith('set src-address '):
+                policies[id]['src'].append(k.split('set src-address ')[1].strip('"'))
+            elif k.startswith('set dst-address '):
+                policies[id]['dst'].append(k.split('set dst-address ')[1].strip('"'))
+            elif k.startswith('set service '):
+                policies[id]['service'].append(k.split('set service ')[1].strip('"'))
+        if __DEBUG__:
+            print("Processed %d" % int(id))
+    return policies
 
 
 def ParseConfig(cnfstr):
     # Populate the service objects
-    #root['service'] = PopulateServices(cnfstr)
+    root['service'] = PopulateServices(cnfstr)
     # Populate the address objects
-    #addressobjs = PopulateAddresses(cnfstr)
+    addressobjs = PopulateAddresses(cnfstr)
     # Enrich the addresses and add valid IPAddress Objects
-    #root['address'] = EnrichAddressObjDict(addressobjs)
-
-
-
+    root['address'] = EnrichAddressObjDict(addressobjs)
+    root['policies'] = PopulatePolicies(cnfstr)
 
 def CountValidAddressObjects(addressobjdict):
     validcnt = 0
@@ -202,6 +246,7 @@ def dumpStats(root, cnfstr):
     validcnt, invalidcnt = CountValidAddressObjects(root['address'])
     print("There are %d address objects with %d valid and %d invalid entries" % (
         len(root['address']), validcnt, invalidcnt))
+    print("There are %d policies" % len(root['policies']))
     print("There were %d parsing failures" % __FAILURES__)
 
 
