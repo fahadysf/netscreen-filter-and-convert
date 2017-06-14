@@ -174,9 +174,6 @@ def PopulatePolicies(cnfstr):
 
 
 
-
-
-
 def ParseConfig(cnfstr):
     # Populate the service objects
     #root['service'] = PopulateServices(cnfstr)
