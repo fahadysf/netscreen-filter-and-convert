@@ -1,10 +1,33 @@
 """
 This module reads the NetScreen configuration and creates address and policy objects in ZODB which can then be used
 by the filtering and conversion scripts.
+
+Author:     Fahad Yousuf <fahadysf@gmail.com>
+
+Copyright (c) 2017 Fahad Yousuf <fahadysf@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 """
 
 # Set the debug flag
-__DEBUG__ = False
+__DEBUG__ = True
 __FAILURES__ = 0
 
 import time
@@ -72,7 +95,9 @@ def PopulateServices(cnfstr):
         else:
             m = service_re.search(l)
         if m and len(m.groupdict()):
-            results.append(m.groupdict())
+            k = m.groupdict().copy()
+            k.update({'rawconfig': l})
+            results.append(k)
         elif re.match(r'set service \"[^\"]*\"\s*$', l):
             pass
         else:
@@ -95,11 +120,56 @@ def PopulateServices(cnfstr):
             objs[objname].append(k)
             results.remove(i)
 
+    # Add the 'Any' Object
+    """
+    objs.update(
+        {'Any':
+             {'ip': '0.0.0.0',
+              'net_mask': '0.0.0.0',
+              'netobj': IPv4Network('0.0.0.0/0'),
+              'rawconfig': None,
+              'valid': True,
+              'zone_name': None
+              }
+         }
+    )
+    """
+
     if __DEBUG__ and __FAILURES__ > 0:
         print("Failure count in PopulateServices(): %d" % __FAILURES__)
 
     return objs
 
+def PopulateServiceGroups(cnfstr):
+    global __FAILURES__
+    lines = cnfstr.splitlines()
+    servicegrouplines = list()
+
+    objs = dict()
+
+    for l in lines:
+        l = l.strip()
+        if l.startswith('set group service ') and (' add ' in l):
+            servicegrouplines.append(l)
+    srvgrp_re = re.compile(
+        r'set group service \"(?P<name>[^\"]*)\" add \"(?P<member>[^\"]*)\"')
+
+    for l in servicegrouplines:
+        m = srvgrp_re.search(l)
+        if m == None:
+            root['failures'].append(l)
+            __FAILURES__ += 1
+            if __DEBUG__:
+                print(l)
+        else:
+            mgd = m.groupdict()
+            name = mgd['name']
+            if name in objs.keys():
+                objs[name].append(mgd['member'])
+            else:
+                objs[name] = [mgd['member'],]
+
+    return objs
 
 def PopulateAddresses(cnfstr):
     global __FAILURES__
@@ -114,7 +184,7 @@ def PopulateAddresses(cnfstr):
         r'set address \"(?P<zone_name>[^\"]*)\" \"(?P<name>\S*)\" (?P<ip>\S*) (?P<net_mask>\S*)$')
     cidr_address_re = re.compile(
         r'set address \"(?P<zone_name>[^\"]*)\" \"(?P<name>\S*)\" (?P<ip>[^\/]*)/(?P<cidr_mask>\d{1,2})$')
-    results = list()
+
     objs = dict()
 
     for l in addresslines:
@@ -137,14 +207,43 @@ def PopulateAddresses(cnfstr):
             objs[objname] = dict()
             k = m.groupdict().copy()
             k.pop('name', None)
+            k.update({'rawconfig': l})
             objs[objname] = k
 
     return objs
 
+def PopulateAddressGroups(cnfstr):
+
+    global __FAILURES__
+    lines = cnfstr.splitlines()
+    addrgrouplines = list()
+
+    objs = dict()
+    for l in lines:
+        l = l.strip()
+        if l.startswith('set group address ') and (' add ' in l):
+            addrgrouplines.append(l)
+    addrgrp_re = re.compile(
+        r'set group address \"(?P<associated_zone>[^\"]*)\" \"(?P<name>[^\"]*)\" add \"(?P<member>[^\"]*)\"')
+
+    for l in addrgrouplines:
+        m = addrgrp_re.search(l)
+        if m == None:
+            root['failures'].append(l)
+            __FAILURES__ += 1
+            if __DEBUG__:
+                print(l)
+        else:
+            mgd = m.groupdict()
+            name = mgd['name']
+            if name in objs.keys():
+                objs[name].append(mgd['member'])
+            else:
+                objs[name] = [mgd['member'], ]
+    return objs
 
 def ConvertIPAdressObject(ip, mask):
     return ipaddress.IPv4Network(ip + '/' + mask, strict=False)
-
 
 def EnrichAddressObjDict(addresses_dict):
     for item, val in addresses_dict.items():
@@ -223,10 +322,14 @@ def PopulatePolicies(cnfstr):
 def ParseConfig(cnfstr):
     # Populate the service objects
     root['service'] = PopulateServices(cnfstr)
+    # Populate the service groups
+    root['servicegrp'] = PopulateServiceGroups(cnfstr)
     # Populate the address objects
     addressobjs = PopulateAddresses(cnfstr)
     # Enrich the addresses and add valid IPAddress Objects
     root['address'] = EnrichAddressObjDict(addressobjs)
+    # Populate the address group objects
+    root['addrgrp'] = PopulateAddressGroups(cnfstr)
     root['policies'] = PopulatePolicies(cnfstr)
 
 def CountValidAddressObjects(addressobjdict):
@@ -243,9 +346,11 @@ def CountValidAddressObjects(addressobjdict):
 def dumpStats(root, cnfstr):
     print("Input config has %d characters" % len(cnfstr))
     print("There are %d service objects" % len(root['service']))
+    print("There are %d service group objects" % len(root['servicegrp']))
     validcnt, invalidcnt = CountValidAddressObjects(root['address'])
     print("There are %d address objects with %d valid and %d invalid entries" % (
         len(root['address']), validcnt, invalidcnt))
+    print("There are %d address group objects" % len(root['addrgrp']))
     print("There are %d policies" % len(root['policies']))
     print("There were %d parsing failures" % __FAILURES__)
 
